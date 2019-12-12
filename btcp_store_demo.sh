@@ -25,7 +25,7 @@ make_swapfile() {
 
 local PREV=$PWD
 cd /
-sudo dd if=/dev/zero of=swapfile bs=1M count=3000
+sudo dd if=/dev/zero of=swapfile bs=1M count=$1
 sudo mkswap swapfile
 sudo chmod 0600 /swapfile
 sudo swapon swapfile
@@ -37,16 +37,21 @@ cd $PREV
 prompt_swapfile() {
 
 echo ""
-echo "Can we make you a 3gb swapfile? EC2 Micro needs it because it takes a lot of memory to build BTCP."
-echo ""
-read -r -p "[y/N] " response
+echo "Can we make you a swapfile? EC2 Micro has limited RAM."
+echo "1) 1GB - recommended for running Bitcore + MongoDB"
+echo "2) 3GB - required when building btcpd from source"
+echo "3) No Swapfile - not recommended on EC2 Micro"
+read -r -p "[1/2/3] " response
 case "$response" in
-    [yY][eE][sS]|[yY]) 
-        make_swapfile
-        ;;
-    *)
-        echo "Not creating swapfile."
-        ;;
+  [1])
+    make_swapfile 1024
+    ;;
+  [2])
+    make_swapfile 3072
+    ;;
+  *)
+    echo "Not creating swapfile."
+    ;;
 esac
 
 }
@@ -84,7 +89,7 @@ fi
 if [ ! -e ~/.btcprivate/btcprivate.conf ]
 then
 
-local RPCPASSWORD=$(head -c 32 /dev/urandom | base64)
+local RPCPASSWORD=$(openssl rand -base64 32 | tr -d /=+ | cut -c -30)
 touch ~/.btcprivate/btcprivate.conf
 cat << EOF > ~/.btcprivate/btcprivate.conf
 #gen=1
@@ -104,14 +109,10 @@ zmqpubhashblock=tcp://127.0.0.1:28332
 rpcallowip=127.0.0.1
 uacomment=bitcore
 addnode=dnsseed.btcprivate.org
+showmetrics=0
 EOF
 
 fi
-
-cd ~/.btcprivate
-
-# Download + decompress blockchain.tar.gz (blocks/, chainstate/) to quickly sync past block 300,000
-fetch_btcp_blockchain
 
 }
 
@@ -121,6 +122,7 @@ wget -qO- https://raw.githubusercontent.com/BTCPrivate/BitcoinPrivate/master/btc
 
 }
 
+# Download + decompress blockchain.tar.gz (blocks/, chainstate/) to quickly sync past block 300,000
 fetch_btcp_blockchain() {
 
 cd ~/.btcprivate
@@ -141,7 +143,7 @@ cd ~/BitcoinPrivate/src
 local RELEASE="1.0.12"
 local COMMIT="69aa9ce"
 local FILE="btcp-${RELEASE}-explorer-${COMMIT}-linux.tar.gz"
-wget -c https://github.com/BTCPrivate/BitcoinPrivate/releases/download/v${RELEASE}-${COMMIT}/${FILE}
+wget -c https://github.com/BTCPrivate/BitcoinPrivate/releases/download/${RELEASE}-${COMMIT}/${FILE}
 tar -zxvf $FILE
 echo "Downloading and extracting BTCP files - Done."
 rm -rf $FILE
@@ -149,8 +151,6 @@ rm -rf $FILE
 }
 
 install_nvm_npm() {
-
-cd ~
 
 # Install npm 
 sudo apt-get -y install npm
@@ -163,7 +163,7 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" # This loads nvm 
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion" # This loads nvm bash_completion 
 
-# Install node v4
+# Install node v4 (as the default)
 nvm install v4
 nvm use v4
 nvm alias default v4
@@ -197,19 +197,21 @@ npm install BTCPrivate/bitcore-node-btcp
 cd btcp-explorer
 
 # Install Insight API / UI (Explorer) (Headless)
-../node_modules/bitcore-node-btcp/bin/bitcore-node install BTCPrivate/insight-api-btcp BTCPrivate/insight-ui-btcp BTCPrivate/store-demo # BTCPrivate/address-watch, BTCPrivate/bitcore-wallet-service (untested)
+../node_modules/bitcore-node-btcp/bin/bitcore-node install ch4ot1c/store-demo #BTCPrivate/insight-api-btcp BTCPrivate/insight-ui-btcp BTCPrivate/store-demo BTCPrivate/address-watch, BTCPrivate/bitcore-wallet-service (untested)
+
+# Symlink to bitcore-node to btcp-explorer dir
+ln -s node_modules/bitcore-node-btcp/bin/bitcore-node bitcore-node
 
 local BITCORE_SERVICE_APP="store-demo" #address-watch, bitcore-wallet-service
+local PORT=8001
 
 # Create config file for Bitcore
 cat << EOF > bitcore-node.json
 {
   "network": "livenet",
-  "port": 8001,
+  "port": $PORT,
   "services": [
     "bitcoind",
-    "insight-api-btcp",
-    "insight-ui-btcp",
     "$BITCORE_SERVICE_APP",
     "web"
   ],
@@ -220,12 +222,8 @@ cat << EOF > bitcore-node.json
         "exec": "$HOME/BitcoinPrivate/src/btcpd"
        }
      },
-     "insight-ui-btcp": {
-       "apiPrefix": "api",
-       "routePrefix": ""
-     },
-     "insight-api-btcp": {
-       "routePrefix": "api"
+     "store-demo": {
+       "mongoURL": "mongodb://localhost:27017/store-demo"
      }
   }
 }
@@ -233,27 +231,43 @@ EOF
 
 #TODO Prompt option + Automate SSL Setup (LetsEncrypt)
 #"https": true,
-#"privateKeyFile": "/etc/ssl/bws.bitpay.com.key",
-#"certificateFile": "/etc/ssl/bws.bitpay.com.crt",
+#"privateKeyFile": "/etc/ssl/x.key",
+#"certificateFile": "/etc/ssl/x.crt",
 
 }
 
-install_bower_browserify_js_libs() {
+install_bower_browserify_uglify_js_libs() {
+  echo "Globally installing bower, browserify, uglify"
+  npm install -g bower browserify uglify
+
   cd ~/btcp-explorer/node_modules/store-demo
-  npm install -g bower browserify
   bower install
+
+  # Build bitcore-lib.js + uglify + copy to widget's js/ dir
+  cd node_modules/bitcore-lib
+  browserify --require ./index.js:bitcore-lib -o bitcore-lib.js
+  uglify -s bitcore-lib.js -o bitcore-lib.min.js
+  cp {bitcore-lib.js,bitcore-lib.min.js} ~/btcp-explorer/node_modules/store-demo/static/js/bitcore-lib
+  bower install --allow-root
   cd node_modules/bitcore-lib-btcp
   browserify --require ./index.js:bitcore-lib-btcp -o bitcore-lib-btcp.js
   cp bitcore-lib-btcp.js ~/btcp-explorer/node_modules/store-demo/static/js/bitcore-lib-btcp
 }
 
+
 run_install() {
 
+echo ---
 echo ""
-echo "Begin Setup - Installing required packages."
+echo "BTCP Merchant Backend Setup - Installing dependencies."
+echo ""
+echo ---
+
+install_ubuntu
+
 echo ""
 
-install_ubuntu > /dev/null
+prompt_swapfile
 
 echo ""
 echo "How would you like to fetch BTCP (btcpd and btcp-cli):"
@@ -267,7 +281,6 @@ case "$response" in
         fetch_btcp_binaries
         ;;
     [2])
-        prompt_swapfile
         clone_and_build_btcp
         ;;
     *)
@@ -277,15 +290,22 @@ esac
 
 init_btcprivate_dotdir
 
+fetch_btcp_blockchain
+
+
 install_nvm_npm
 
 install_mongodb
 
+cd ~
+
 install_bitcore
 
-install_bower_browserify_js_libs
+install_bower_browserify_uglify_js_libs
 
-echo "Complete."
+cd ~
+
+echo "Installation Complete."
 echo "" 
 
 # Verify that nvm is exported
@@ -293,11 +313,13 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" # This loads nvm 
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion" # This loads nvm bash_completion 
 
-echo "To start the demo, run:"
-echo "cd ~/btcp-explorer; nvm use v4; ./node_modules/bitcore-node-btcp/bin/bitcore-node start"
+echo "To start the daemon + its interfaces, run:"
+echo "cd ~/btcp-explorer; ./bitcore-node start"
 echo ""
-echo "To view the demo in your browser:"
-echo "http://my_ip:8001"
+echo "Runs on port $PORT (bitcore-node.json)."
+echo ""
+echo "Note - MongoDB needs to be running in the background for store-demo:"
+echo "mongod &"
 echo ""
 
 }
